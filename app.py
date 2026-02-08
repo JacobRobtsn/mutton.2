@@ -17,6 +17,7 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
+from trellis2.utils.mc_export import to_schem
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -514,6 +515,27 @@ def extract_glb(
     return glb_path, glb_path
 
 
+def extract_schem(
+    state: dict,
+    mc_resolution: int,
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+) -> str:
+    """
+    Extract a Minecraft .schem file from the 3D model.
+    """
+    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    shape_slat, tex_slat, res = unpack_state(state)
+    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
+    os.makedirs(user_dir, exist_ok=True)
+    schem_path = os.path.join(user_dir, f'sample_{timestamp}.schem')
+    to_schem(mesh, target_resolution=int(mc_resolution), output_path=schem_path)
+    torch.cuda.empty_cache()
+    return schem_path
+
+
 with gr.Blocks(delete_cache=(600, 600)) as demo:
     gr.Markdown("""
     ## Image to 3D Asset with [TRELLIS.2](https://microsoft.github.io/TRELLIS.2)
@@ -530,6 +552,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
+            mc_resolution = gr.Slider(32, 256, label="Minecraft Build Size (blocks)", value=64, step=16)
             
             generate_btn = gr.Button("Generate")
                 
@@ -557,10 +580,14 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             with gr.Walkthrough(selected=0) as walkthrough:
                 with gr.Step("Preview", id=0):
                     preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
-                    extract_btn = gr.Button("Extract GLB")
+                    with gr.Row():
+                        extract_btn = gr.Button("Extract GLB")
+                        extract_schem_btn = gr.Button("Extract Schematic (.schem)")
                 with gr.Step("Extract", id=1):
                     glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                    download_btn = gr.DownloadButton(label="Download GLB")
+                    with gr.Row():
+                        download_btn = gr.DownloadButton(label="Download GLB")
+                        download_schem_btn = gr.DownloadButton(label="Download .schem")
                     
         with gr.Column(scale=1, min_width=172):
             examples = gr.Examples(
@@ -611,6 +638,12 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         extract_glb,
         inputs=[output_buf, decimation_target, texture_size],
         outputs=[glb_output, download_btn],
+    )
+    
+    extract_schem_btn.click(
+        extract_schem,
+        inputs=[output_buf, mc_resolution],
+        outputs=[download_schem_btn],
     )
         
 
