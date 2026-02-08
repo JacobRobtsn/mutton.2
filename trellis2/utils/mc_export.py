@@ -232,10 +232,12 @@ def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> 
 # Public API
 # ──────────────────────────────────────────────
 
+_MAX_VOLUME = 8_000_000  # 200^3 — safe upper bound for .schem viewers
+
 @torch.no_grad()
 def to_schem(
     mesh_with_voxel,
-    target_resolution: Optional[int] = None,
+    target_resolution: Optional[int] = 128,
     output_path: Optional[str] = None,
 ) -> bytes:
     """
@@ -246,7 +248,7 @@ def to_schem(
     
     Args:
         mesh_with_voxel: MeshWithVoxel from pipeline output
-        target_resolution: optional int, downsample to this block count per axis.
+        target_resolution: downsample to this block count per axis (default 128).
         output_path: if set, write .schem to this path
     
     Returns:
@@ -262,9 +264,12 @@ def to_schem(
 
     native_res = int(coords.max().item()) + 1
 
-    # ── 2. GPU downsample ──
+    # ── 2. GPU downsample (always downsample if native > target) ──
     if target_resolution is not None and target_resolution < native_res:
         coords, colors = _downsample_gpu(coords, colors, native_res, target_resolution)
+    elif native_res > 256:
+        # Safety cap: even if no target given, don't exceed 256
+        coords, colors = _downsample_gpu(coords, colors, native_res, 256)
 
     # ── 3. GPU color matching ──
     colors_255 = (colors * 255.0).clamp(0, 255)
