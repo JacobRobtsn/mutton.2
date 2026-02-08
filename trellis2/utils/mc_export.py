@@ -1,225 +1,226 @@
 """
 Convert TRELLIS.2 MeshWithVoxel output to Minecraft .schem (Sponge Schematic v2).
+
+GPU-accelerated pipeline:
+  1. Downsample sparse voxels on GPU (torch unique + scatter)
+  2. Color-to-block matching on GPU (brute-force L2, ~150 palette entries)
+  3. Scatter block indices into flat volume on GPU
+  4. Transfer only the final int32 array to CPU for varint + NBT serialization
 """
 import io
 import gzip
 import struct
-from typing import Optional, Dict
+from typing import Optional
 import numpy as np
 import torch
 
-from .mc_palette import match_colors_batch
+from .mc_palette import match_colors_gpu, BLOCK_NAMES
 
 
 # ──────────────────────────────────────────────
-# Minimal NBT writer (avoids external dependency)
-# Sponge Schematic v2 spec uses Named Binary Tag format
+# Minimal NBT writer
 # ──────────────────────────────────────────────
 
-TAG_END = 0
-TAG_BYTE = 1
-TAG_SHORT = 2
-TAG_INT = 3
-TAG_LONG = 4
-TAG_FLOAT = 5
-TAG_DOUBLE = 6
-TAG_BYTE_ARRAY = 7
-TAG_STRING = 8
-TAG_LIST = 9
-TAG_COMPOUND = 10
-TAG_INT_ARRAY = 11
-TAG_LONG_ARRAY = 12
+_TAG_END = 0
+_TAG_SHORT = 2
+_TAG_INT = 3
+_TAG_BYTE_ARRAY = 7
+_TAG_STRING = 8
+_TAG_COMPOUND = 10
+_TAG_INT_ARRAY = 11
 
 
-def _write_tag_header(buf, tag_type, name):
-    buf.write(struct.pack(">b", tag_type))
-    encoded = name.encode("utf-8")
-    buf.write(struct.pack(">H", len(encoded)))
-    buf.write(encoded)
+def _whdr(buf, tt, name):
+    buf.write(struct.pack(">b", tt))
+    e = name.encode("utf-8")
+    buf.write(struct.pack(">H", len(e)))
+    buf.write(e)
 
-
-def _write_byte(buf, name, val):
-    _write_tag_header(buf, TAG_BYTE, name)
-    buf.write(struct.pack(">b", val))
-
-
-def _write_short(buf, name, val):
-    _write_tag_header(buf, TAG_SHORT, name)
-    buf.write(struct.pack(">h", val))
-
-
-def _write_int(buf, name, val):
-    _write_tag_header(buf, TAG_INT, name)
-    buf.write(struct.pack(">i", val))
-
-
-def _write_string(buf, name, val):
-    _write_tag_header(buf, TAG_STRING, name)
-    encoded = val.encode("utf-8")
-    buf.write(struct.pack(">H", len(encoded)))
-    buf.write(encoded)
-
-
-def _write_byte_array(buf, name, data: bytes):
-    _write_tag_header(buf, TAG_BYTE_ARRAY, name)
-    buf.write(struct.pack(">i", len(data)))
-    buf.write(data)
-
-
-def _write_int_array(buf, name, vals):
-    _write_tag_header(buf, TAG_INT_ARRAY, name)
-    buf.write(struct.pack(">i", len(vals)))
-    for v in vals:
-        buf.write(struct.pack(">i", v))
-
-
-def _write_compound_start(buf, name):
-    _write_tag_header(buf, TAG_COMPOUND, name)
-
-
-def _write_compound_end(buf):
-    buf.write(struct.pack(">b", TAG_END))
-
-
-def _encode_varint(value):
-    """Encode an integer as a varint (used by Sponge Schematic BlockData)."""
-    result = bytearray()
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        if value != 0:
-            byte |= 0x80
-        result.append(byte)
-        if value == 0:
-            break
-    return bytes(result)
+def _wshort(buf, n, v):  _whdr(buf, _TAG_SHORT, n);   buf.write(struct.pack(">h", v))
+def _wint(buf, n, v):    _whdr(buf, _TAG_INT, n);      buf.write(struct.pack(">i", v))
+def _wstr(buf, n, v):    _whdr(buf, _TAG_STRING, n);   e=v.encode("utf-8"); buf.write(struct.pack(">H", len(e))); buf.write(e)
+def _wbarr(buf, n, d):   _whdr(buf, _TAG_BYTE_ARRAY, n); buf.write(struct.pack(">i", len(d))); buf.write(d)
+def _wiarr(buf, n, vs):  _whdr(buf, _TAG_INT_ARRAY, n); buf.write(struct.pack(">i", len(vs))); buf.write(struct.pack(f">{len(vs)}i", *vs))
+def _wcstart(buf, n):    _whdr(buf, _TAG_COMPOUND, n)
+def _wcend(buf):          buf.write(b'\x00')
 
 
 # ──────────────────────────────────────────────
-# Core export functions
+# Vectorized varint encoder (numpy, no Python loop)
 # ──────────────────────────────────────────────
 
-def _downsample_voxels(coords, colors, native_res, target_res):
+def _varint_encode_batch(values: np.ndarray) -> bytes:
     """
-    Downsample sparse voxels by binning into a coarser grid and averaging colors.
+    Encode an array of non-negative int32s as concatenated varints.
+    Palette sizes are small (<256 typically), so most values fit in 1-2 bytes.
+    Vectorized: splits into byte-lanes then masks, avoids per-element Python loop.
+    """
+    v = values.astype(np.uint32)
+    # Max varint length for values < 2^28 is 4 bytes; palette indices are tiny
+    b0 = (v & 0x7F).astype(np.uint8)
+    v1 = v >> 7
+    b1 = (v1 & 0x7F).astype(np.uint8)
+    v2 = v1 >> 7
+    b2 = (v2 & 0x7F).astype(np.uint8)
+    v3 = v2 >> 7
+    b3 = (v3 & 0x7F).astype(np.uint8)
+
+    need1 = v1 > 0   # needs at least 2 bytes
+    need2 = v2 > 0   # needs at least 3 bytes
+    need3 = v3 > 0   # needs at least 4 bytes
+
+    # Set continuation bits
+    b0[need1] |= 0x80
+    b1[need2] |= 0x80
+    b2[need3] |= 0x80
+
+    # Count total bytes needed
+    lengths = np.ones(len(values), dtype=np.int32)
+    lengths += need1.astype(np.int32)
+    lengths += need2.astype(np.int32)
+    lengths += need3.astype(np.int32)
+    total = int(lengths.sum())
+
+    # Build output
+    out = np.empty(total, dtype=np.uint8)
+    offsets = np.empty(len(values) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+
+    # Scatter bytes (vectorized via fancy indexing)
+    out[offsets[:-1]] = b0
+    mask1 = need1
+    out[offsets[:-1][mask1] + 1] = b1[mask1]
+    mask2 = need2
+    out[offsets[:-1][mask2] + 2] = b2[mask2]
+    mask3 = need3
+    out[offsets[:-1][mask3] + 3] = b3[mask3]
+
+    return out.tobytes()
+
+
+# ──────────────────────────────────────────────
+# GPU downsample
+# ──────────────────────────────────────────────
+
+@torch.no_grad()
+def _downsample_gpu(coords: torch.Tensor, colors: torch.Tensor,
+                    native_res: int, target_res: int):
+    """
+    Downsample sparse voxels on GPU by binning + averaging colors.
     
     Args:
-        coords: (N, 3) int numpy array, voxel positions in [0, native_res)
-        colors: (N, 3) float numpy array, RGB in [0, 1]
-        native_res: int, original grid resolution
-        target_res: int, desired grid resolution (must be <= native_res)
+        coords: (N, 3) int tensor on CUDA
+        colors: (N, 3) float tensor on CUDA, [0, 1]
+        native_res: original grid size
+        target_res: desired grid size
     
     Returns:
-        new_coords: (M, 3) int array
-        new_colors: (M, 3) float array
+        new_coords (M, 3) int, new_colors (M, 3) float — both on CUDA
     """
     if target_res >= native_res:
         return coords, colors
 
     ratio = native_res / target_res
-    binned = (coords / ratio).astype(np.int32)
-    binned = np.clip(binned, 0, target_res - 1)
+    binned = (coords.float() / ratio).int().clamp(0, target_res - 1)
 
-    # Unique bins and average colors
-    # Encode 3D coords to 1D keys
-    keys = binned[:, 0] * target_res * target_res + binned[:, 1] * target_res + binned[:, 2]
-    unique_keys, inverse = np.unique(keys, return_inverse=True)
+    # 1D keys for unique
+    tr2 = target_res * target_res
+    keys = binned[:, 0] * tr2 + binned[:, 1] * target_res + binned[:, 2]
 
-    new_colors = np.zeros((len(unique_keys), 3), dtype=np.float64)
-    counts = np.zeros(len(unique_keys), dtype=np.float64)
-    np.add.at(new_colors, inverse, colors)
-    np.add.at(counts, inverse, 1)
-    new_colors /= counts[:, None]
+    unique_keys, inverse = torch.unique(keys, return_inverse=True)
+    M = unique_keys.shape[0]
 
-    # Decode keys back to coords
-    new_coords = np.stack([
-        unique_keys // (target_res * target_res),
+    # Scatter-add colors and counts
+    new_colors = torch.zeros(M, 3, device=colors.device, dtype=torch.float32)
+    counts = torch.zeros(M, 1, device=colors.device, dtype=torch.float32)
+    new_colors.scatter_add_(0, inverse.unsqueeze(1).expand(-1, 3), colors)
+    counts.scatter_add_(0, inverse.unsqueeze(1), torch.ones(keys.shape[0], 1, device=colors.device))
+    new_colors /= counts
+
+    # Decode keys
+    new_coords = torch.stack([
+        unique_keys // tr2,
         (unique_keys // target_res) % target_res,
         unique_keys % target_res,
-    ], axis=1).astype(np.int32)
+    ], dim=1).int()
 
-    return new_coords, new_colors.astype(np.float32)
+    return new_coords, new_colors
 
 
-def voxels_to_schem_bytes(
-    coords: np.ndarray,
-    block_ids: list,
-    y_up: bool = True,
-) -> bytes:
+# ──────────────────────────────────────────────
+# .schem builder (CPU serialization of GPU results)
+# ──────────────────────────────────────────────
+
+def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> bytes:
     """
-    Build a Sponge Schematic v2 .schem file from voxel coordinates and block IDs.
-    
-    Args:
-        coords: (N, 3) int array of occupied voxel positions (x, y, z)
-        block_ids: list of N block state strings (e.g. "minecraft:stone")
-        y_up: if True, treat axis 1 as Y (height). TRELLIS.2 uses Y-up.
-    
-    Returns:
-        gzipped bytes of the .schem file
+    Build gzipped Sponge Schematic v2 from zero-origin coords + per-voxel palette indices.
+    coords_cpu: (N, 3) int32
+    palette_idxs_cpu: (N,) int32, indices into BLOCK_NAMES (+ offset by 1 for air at 0)
     """
-    coords = coords.copy()
     # Shift to zero-origin
-    min_c = coords.min(axis=0)
-    coords -= min_c
+    min_c = coords_cpu.min(axis=0)
+    coords_cpu = coords_cpu - min_c
+    max_c = coords_cpu.max(axis=0)
 
-    max_c = coords.max(axis=0)
-    # TRELLIS.2: axis order is (X, Y, Z) with Y up
-    # .schem: Width=X, Height=Y, Length=Z
-    width = int(max_c[0]) + 1
+    width  = int(max_c[0]) + 1
     height = int(max_c[1]) + 1
     length = int(max_c[2]) + 1
 
-    # Build palette
-    unique_blocks = list(set(block_ids))
-    # Air is always index 0 if we need it
-    if "minecraft:air" not in unique_blocks:
-        unique_blocks.insert(0, "minecraft:air")
-    palette_map = {b: i for i, b in enumerate(unique_blocks)}
+    # Collect unique palette entries actually used
+    used_palette = np.unique(palette_idxs_cpu)
+    # Build compact palette: air=0, then each used block
+    block_names = ["minecraft:air"]
+    remap = {}  # old palette idx -> new compact idx
+    for old_idx in used_palette:
+        remap[int(old_idx)] = len(block_names)
+        block_names.append(BLOCK_NAMES[int(old_idx)])
 
-    # Build 3D block data array (default to air = 0)
+    # Fill flat volume (default 0 = air)
     total = width * height * length
-    block_data_flat = np.zeros(total, dtype=np.int32)
+    flat = np.zeros(total, dtype=np.int32)
 
-    for i in range(len(coords)):
-        x, y, z = int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2])
-        # .schem index order: (y * length + z) * width + x
-        idx = (y * length + z) * width + x
-        block_data_flat[idx] = palette_map[block_ids[i]]
+    # Vectorized scatter: compute linear indices then assign
+    x = coords_cpu[:, 0].astype(np.int64)
+    y = coords_cpu[:, 1].astype(np.int64)
+    z = coords_cpu[:, 2].astype(np.int64)
+    lin = y * length * width + z * width + x
+    # Remap palette indices
+    remap_arr = np.zeros(len(BLOCK_NAMES), dtype=np.int32)
+    for old_idx, new_idx in remap.items():
+        remap_arr[old_idx] = new_idx
+    flat[lin] = remap_arr[palette_idxs_cpu]
 
-    # Varint encode block data
-    varint_buf = bytearray()
-    for val in block_data_flat:
-        varint_buf.extend(_encode_varint(val))
+    # Varint-encode block data
+    block_data = _varint_encode_batch(flat)
+
+    # Build palette map for NBT
+    palette_map = {name: i for i, name in enumerate(block_names)}
 
     # Write NBT
     buf = io.BytesIO()
-    _write_compound_start(buf, "Schematic")
-    _write_int(buf, "Version", 2)
-    _write_int(buf, "DataVersion", 3578)  # 1.20.4
-    _write_short(buf, "Width", width)
-    _write_short(buf, "Height", height)
-    _write_short(buf, "Length", length)
+    _wcstart(buf, "Schematic")
+    _wint(buf, "Version", 2)
+    _wint(buf, "DataVersion", 3578)
+    _wshort(buf, "Width", width)
+    _wshort(buf, "Height", height)
+    _wshort(buf, "Length", length)
 
-    # Palette compound
-    _write_compound_start(buf, "Palette")
-    for block_name, idx in palette_map.items():
-        _write_int(buf, block_name, idx)
-    _write_compound_end(buf)
+    _wcstart(buf, "Palette")
+    for name, idx in palette_map.items():
+        _wint(buf, name, idx)
+    _wcend(buf)
 
-    _write_int(buf, "PaletteMax", len(palette_map))
-    _write_byte_array(buf, "BlockData", bytes(varint_buf))
+    _wint(buf, "PaletteMax", len(palette_map))
+    _wbarr(buf, "BlockData", block_data)
 
-    # Metadata (optional but some tools expect it)
-    _write_compound_start(buf, "Metadata")
-    _write_string(buf, "Generator", "TRELLIS2-Minecraft")
-    _write_compound_end(buf)
+    _wcstart(buf, "Metadata")
+    _wstr(buf, "Generator", "TRELLIS2-Minecraft")
+    _wcend(buf)
 
-    # Offset
-    _write_int_array(buf, "Offset", [0, 0, 0])
+    _wiarr(buf, "Offset", [0, 0, 0])
+    _wcend(buf)
 
-    _write_compound_end(buf)  # end Schematic
-
-    # Gzip compress
     raw = buf.getvalue()
     out = io.BytesIO()
     with gzip.GzipFile(fileobj=out, mode="wb") as gz:
@@ -227,6 +228,11 @@ def voxels_to_schem_bytes(
     return out.getvalue()
 
 
+# ──────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────
+
+@torch.no_grad()
 def to_schem(
     mesh_with_voxel,
     target_resolution: Optional[int] = None,
@@ -235,41 +241,41 @@ def to_schem(
     """
     Convert a TRELLIS.2 MeshWithVoxel to a Minecraft .schem file.
     
+    GPU-accelerated: downsample + color matching run on CUDA.
+    Only the final NBT serialization happens on CPU.
+    
     Args:
         mesh_with_voxel: MeshWithVoxel from pipeline output
-        target_resolution: optional int, downsample voxels to this grid size.
-            If None, uses native resolution.
-        output_path: if provided, write .schem file to this path
+        target_resolution: optional int, downsample to this block count per axis.
+        output_path: if set, write .schem to this path
     
     Returns:
-        bytes of the .schem file (gzipped NBT)
+        gzipped .schem bytes
     """
     m = mesh_with_voxel
+    device = m.coords.device
 
-    # Extract coords and base_color from sparse voxel attrs
-    coords_t = m.coords  # (N, 3) int tensor
-    attrs_t = m.attrs     # (N, C) float tensor
+    # ── 1. Extract voxel data (stay on GPU) ──
+    coords = m.coords.int()                                  # (N, 3)
     color_slice = m.layout.get("base_color", slice(0, 3))
-    colors_t = attrs_t[:, color_slice]  # (N, 3) in [0, 1]
+    colors = m.attrs[:, color_slice].float()                  # (N, 3) in [0,1]
 
-    coords_np = coords_t.cpu().numpy().astype(np.int32)
-    colors_np = colors_t.cpu().numpy().astype(np.float32)
+    native_res = int(coords.max().item()) + 1
 
-    # Compute native resolution from coords
-    native_res = int(coords_np.max()) + 1
-
-    # Optional downsample
+    # ── 2. GPU downsample ──
     if target_resolution is not None and target_resolution < native_res:
-        coords_np, colors_np = _downsample_voxels(
-            coords_np, colors_np, native_res, target_resolution
-        )
+        coords, colors = _downsample_gpu(coords, colors, native_res, target_resolution)
 
-    # Map colors (0-1) to block IDs via palette
-    colors_255 = np.clip(colors_np * 255.0, 0, 255)
-    block_ids = match_colors_batch(colors_255)
+    # ── 3. GPU color matching ──
+    colors_255 = (colors * 255.0).clamp(0, 255)
+    palette_idxs = match_colors_gpu(colors_255)               # (M,) int64 on GPU
 
-    # Build .schem
-    schem_bytes = voxels_to_schem_bytes(coords_np, block_ids)
+    # ── 4. Single transfer to CPU ──
+    coords_cpu = coords.cpu().numpy().astype(np.int32)
+    palette_idxs_cpu = palette_idxs.cpu().numpy().astype(np.int32)
+
+    # ── 5. Serialize (CPU) ──
+    schem_bytes = _build_schem_bytes(coords_cpu, palette_idxs_cpu)
 
     if output_path is not None:
         with open(output_path, "wb") as f:

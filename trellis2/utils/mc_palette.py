@@ -1,9 +1,9 @@
 """
 Minecraft block palette: maps block state strings to average top-face RGB colors.
-Provides fast nearest-neighbor color matching via scipy KD-tree.
+GPU-accelerated nearest-neighbor color matching via brute-force L2 on CUDA.
 """
+import torch
 import numpy as np
-from scipy.spatial import KDTree
 
 # {block_state_string: (R, G, B)} — average top-face colors, 0-255
 BLOCK_COLORS = {
@@ -206,30 +206,40 @@ BLOCK_COLORS = {
     "minecraft:black_stained_glass":     (25, 25, 25),
 }
 
-# Precompute arrays
-_BLOCK_NAMES = list(BLOCK_COLORS.keys())
-_BLOCK_RGB = np.array([BLOCK_COLORS[b] for b in _BLOCK_NAMES], dtype=np.float32)
-_TREE = KDTree(_BLOCK_RGB)
+# Precompute lists (order-stable)
+BLOCK_NAMES = list(BLOCK_COLORS.keys())
+_PALETTE_NP = np.array([BLOCK_COLORS[b] for b in BLOCK_NAMES], dtype=np.float32)
+
+# Lazy-init GPU tensor (created on first use, cached per device)
+_palette_cache = {}
 
 
-def match_color(rgb):
+def _get_palette_gpu(device):
+    """Get palette tensor on the given CUDA device (cached)."""
+    if device not in _palette_cache:
+        _palette_cache[device] = torch.tensor(
+            _PALETTE_NP, dtype=torch.float32, device=device
+        )  # (K, 3)
+    return _palette_cache[device]
+
+
+@torch.no_grad()
+def match_colors_gpu(colors: torch.Tensor) -> torch.Tensor:
     """
-    Find closest Minecraft block for a single RGB tuple/array (0-255).
-    Returns block state string.
-    """
-    _, idx = _TREE.query(rgb)
-    return _BLOCK_NAMES[idx]
-
-
-def match_colors_batch(rgbs):
-    """
-    Find closest Minecraft blocks for an array of RGB values.
+    GPU brute-force nearest-neighbor: for each input color find the closest
+    palette entry by squared L2 distance.
     
     Args:
-        rgbs: (N, 3) numpy array, 0-255 float or int
+        colors: (N, 3) float tensor on CUDA, values 0-255
+    
     Returns:
-        list of N block state strings
+        (N,) int64 tensor of palette indices on same device
     """
-    rgbs = np.asarray(rgbs, dtype=np.float32)
-    _, idxs = _TREE.query(rgbs)
-    return [_BLOCK_NAMES[i] for i in idxs]
+    palette = _get_palette_gpu(colors.device)  # (K, 3)
+    # Squared L2 via expansion: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a·b
+    # This avoids materializing the full (N, K, 3) difference tensor
+    a_sq = (colors * colors).sum(dim=1, keepdim=True)      # (N, 1)
+    b_sq = (palette * palette).sum(dim=1, keepdim=True).T   # (1, K)
+    dots = colors @ palette.T                                # (N, K)
+    dists = a_sq + b_sq - 2.0 * dots                        # (N, K)
+    return dists.argmin(dim=1)                               # (N,)
