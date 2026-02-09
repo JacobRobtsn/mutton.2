@@ -4,8 +4,9 @@ Convert TRELLIS.2 MeshWithVoxel output to Minecraft .schem (Sponge Schematic v2)
 GPU-accelerated pipeline:
   1. Downsample sparse voxels on GPU (torch unique + scatter)
   2. Color-to-block matching on GPU (brute-force L2, ~150 palette entries)
-  3. Scatter block indices into flat volume on GPU
-  4. Transfer only the final int32 array to CPU for varint + NBT serialization
+  3. Geometry analysis on GPU (neighbor masks → slab/stair/fence/wall classification)
+  4. Resolve per-voxel block state strings (CPU)
+  5. Serialize NBT + gzip (CPU)
 """
 import io
 import gzip
@@ -14,7 +15,15 @@ from typing import Optional
 import numpy as np
 import torch
 
-from .mc_palette import match_colors_gpu, BLOCK_NAMES
+from .mc_palette import (
+    match_colors_gpu, BLOCK_NAMES, MATERIAL_FAMILIES, build_block_state,
+)
+from .mc_geometry import (
+    classify_and_resolve,
+    FULL_BLOCK, BOTTOM_SLAB, TOP_SLAB, STAIR, FENCE,
+    DOOR_LOWER, DOOR_UPPER, TRAPDOOR,
+    _EAST, _WEST, _SOUTH, _NORTH, _FACING_STR,
+)
 
 
 # ──────────────────────────────────────────────
@@ -155,14 +164,100 @@ def _downsample_gpu(coords: torch.Tensor, colors: torch.Tensor,
 
 
 # ──────────────────────────────────────────────
-# .schem builder (CPU serialization of GPU results)
+# Block state resolution (CPU)
 # ──────────────────────────────────────────────
 
-def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> bytes:
+_FACING_MAP = {int(_EAST): "east", int(_WEST): "west",
+               int(_SOUTH): "south", int(_NORTH): "north"}
+
+
+def _resolve_block_states(palette_idxs, classifications, facing, half, horiz_neighbors):
     """
-    Build gzipped Sponge Schematic v2 from zero-origin coords + per-voxel palette indices.
-    coords_cpu: (N, 3) int32
-    palette_idxs_cpu: (N,) int32, indices into BLOCK_NAMES (+ offset by 1 for air at 0)
+    Resolve each voxel to a full block state string combining color-match
+    palette index, geometry classification, and directional properties.
+
+    Returns list[str] of length N.
+    """
+    # Start with all full blocks (fast numpy lookup)
+    block_names_arr = np.array(BLOCK_NAMES)
+    result = block_names_arr[palette_idxs].tolist()
+
+    # Only loop over special (non-full-block) voxels
+    special = np.where(classifications != FULL_BLOCK)[0]
+
+    for i in special:
+        base = result[i]
+        family = MATERIAL_FAMILIES.get(base)
+        if family is None:
+            continue  # no variants → stays as full block
+
+        c = int(classifications[i])
+
+        if c in (BOTTOM_SLAB, TOP_SLAB):
+            if "slab" not in family:
+                continue
+            stype = "bottom" if c == BOTTOM_SLAB else "top"
+            result[i] = build_block_state(family["slab"],
+                {"type": stype, "waterlogged": "false"})
+
+        elif c == STAIR:
+            if "stairs" not in family:
+                continue
+            fd = _FACING_MAP.get(int(facing[i]), "north")
+            h  = "bottom" if half[i] == 0 else "top"
+            result[i] = build_block_state(family["stairs"],
+                {"facing": fd, "half": h, "shape": "straight",
+                 "waterlogged": "false"})
+
+        elif c == FENCE:
+            if "fence" in family:
+                result[i] = build_block_state(family["fence"], {
+                    "east":  "true" if horiz_neighbors[i, 0] else "false",
+                    "north": "true" if horiz_neighbors[i, 3] else "false",
+                    "south": "true" if horiz_neighbors[i, 2] else "false",
+                    "west":  "true" if horiz_neighbors[i, 1] else "false",
+                    "waterlogged": "false",
+                })
+            elif "wall" in family:
+                result[i] = build_block_state(family["wall"], {
+                    "east":  "low" if horiz_neighbors[i, 0] else "none",
+                    "north": "low" if horiz_neighbors[i, 3] else "none",
+                    "south": "low" if horiz_neighbors[i, 2] else "none",
+                    "west":  "low" if horiz_neighbors[i, 1] else "none",
+                    "up": "true", "waterlogged": "false",
+                })
+
+        elif c in (DOOR_LOWER, DOOR_UPPER):
+            if "door" not in family:
+                continue
+            fd = _FACING_MAP.get(int(facing[i]), "north")
+            dh = "lower" if c == DOOR_LOWER else "upper"
+            result[i] = build_block_state(family["door"], {
+                "facing": fd, "half": dh, "hinge": "left",
+                "open": "false", "powered": "false",
+            })
+
+        elif c == TRAPDOOR:
+            if "trapdoor" not in family:
+                continue
+            fd = _FACING_MAP.get(int(facing[i]), "north")
+            result[i] = build_block_state(family["trapdoor"], {
+                "facing": fd, "half": "bottom", "open": "false",
+                "powered": "false", "waterlogged": "false",
+            })
+
+    return result
+
+
+# ──────────────────────────────────────────────
+# .schem builder (CPU serialization)
+# ──────────────────────────────────────────────
+
+def _build_schem_bytes(coords_cpu: np.ndarray, block_states: list) -> bytes:
+    """
+    Build gzipped Sponge Schematic v2 from coords + per-voxel block state strings.
+    coords_cpu:    (N, 3) int32
+    block_states:  list[str] length N
     """
     # Shift to zero-origin
     min_c = coords_cpu.min(axis=0)
@@ -174,39 +269,35 @@ def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> 
     height = int(max_c[2]) + 1   # TRELLIS Z → MC Y (up)
     length = int(max_c[1]) + 1   # TRELLIS Y → MC Z (depth)
 
-    # Collect unique palette entries actually used
-    used_palette = np.unique(palette_idxs_cpu)
-    # Build compact palette: air=0, then each used block
-    block_names = ["minecraft:air"]
-    remap = {}  # old palette idx -> new compact idx
-    for old_idx in used_palette:
-        remap[int(old_idx)] = len(block_names)
-        block_names.append(BLOCK_NAMES[int(old_idx)])
+    # Build palette from unique block state strings
+    states_arr = np.array(block_states, dtype=object)
+    unique_states, inverse = np.unique(states_arr, return_inverse=True)
+
+    palette_map = {"minecraft:air": 0}
+    for s in unique_states:
+        s = str(s)
+        if s not in palette_map:
+            palette_map[s] = len(palette_map)
+
+    # Map each voxel to compact palette index
+    state_idx_map = np.array([palette_map[str(s)] for s in unique_states], dtype=np.int32)
+    voxel_palette = state_idx_map[inverse]
 
     # Fill flat volume (default 0 = air)
     total = width * height * length
     flat = np.zeros(total, dtype=np.int32)
 
-    # Vectorized scatter: compute linear indices then assign
-    # Swap TRELLIS col1↔col2 so MC Y (up) = TRELLIS col2
+    # Vectorized scatter
     x = coords_cpu[:, 0].astype(np.int64)
     y = coords_cpu[:, 2].astype(np.int64)   # TRELLIS Z → MC Y
     z = coords_cpu[:, 1].astype(np.int64)   # TRELLIS Y → MC Z
     lin = y * length * width + z * width + x
-    # Remap palette indices
-    remap_arr = np.zeros(len(BLOCK_NAMES), dtype=np.int32)
-    for old_idx, new_idx in remap.items():
-        remap_arr[old_idx] = new_idx
-    flat[lin] = remap_arr[palette_idxs_cpu]
+    flat[lin] = voxel_palette
 
     # Varint-encode block data
     block_data = _varint_encode_batch(flat)
 
-    # Build palette map for NBT
-    palette_map = {name: i for i, name in enumerate(block_names)}
-
     # Write NBT — Sponge Schematic v2
-    # Root is an unnamed compound wrapping "Schematic" compound for max compat
     buf = io.BytesIO()
     _wcstart(buf, "Schematic")
     _wint(buf, "Version", 2)
@@ -251,17 +342,19 @@ def to_schem(
     mesh_with_voxel,
     target_resolution: Optional[int] = 128,
     output_path: Optional[str] = None,
+    detect_doors: bool = False,
 ) -> bytes:
     """
     Convert a TRELLIS.2 MeshWithVoxel to a Minecraft .schem file.
     
-    GPU-accelerated: downsample + color matching run on CUDA.
-    Only the final NBT serialization happens on CPU.
+    GPU-accelerated: downsample + color matching + geometry analysis on CUDA.
+    Only block-state resolution and NBT serialization happen on CPU.
     
     Args:
         mesh_with_voxel: MeshWithVoxel from pipeline output
         target_resolution: downsample to this block count per axis (default 128).
         output_path: if set, write .schem to this path
+        detect_doors: enable door/trapdoor detection (prone to false positives)
     
     Returns:
         gzipped .schem bytes
@@ -276,23 +369,35 @@ def to_schem(
 
     native_res = int(coords.max().item()) + 1
 
-    # ── 2. GPU downsample (always downsample if native > target) ──
+    # ── 2. GPU downsample ──
     if target_resolution is not None and target_resolution < native_res:
         coords, colors = _downsample_gpu(coords, colors, native_res, target_resolution)
     elif native_res > 256:
-        # Safety cap: even if no target given, don't exceed 256
         coords, colors = _downsample_gpu(coords, colors, native_res, 256)
 
     # ── 3. GPU color matching ──
     colors_255 = (colors * 255.0).clamp(0, 255)
     palette_idxs = match_colors_gpu(colors_255)               # (M,) int64 on GPU
 
-    # ── 4. Single transfer to CPU ──
-    coords_cpu = coords.cpu().numpy().astype(np.int32)
-    palette_idxs_cpu = palette_idxs.cpu().numpy().astype(np.int32)
+    # ── 4. GPU geometry analysis ──
+    grid_size = int(coords.max().item()) + 1
+    classifications, geo_props = classify_and_resolve(
+        coords, grid_size, detect_doors=detect_doors)
 
-    # ── 5. Serialize (CPU) ──
-    schem_bytes = _build_schem_bytes(coords_cpu, palette_idxs_cpu)
+    # ── 5. Single transfer to CPU ──
+    coords_cpu      = coords.cpu().numpy().astype(np.int32)
+    palette_cpu     = palette_idxs.cpu().numpy().astype(np.int32)
+    cls_cpu         = classifications.cpu().numpy()
+    facing_cpu      = geo_props["facing"].cpu().numpy()
+    half_cpu        = geo_props["half"].cpu().numpy()
+    horiz_cpu       = geo_props["horiz_neighbors"].cpu().numpy()
+
+    # ── 6. Resolve block state strings (CPU) ──
+    block_states = _resolve_block_states(
+        palette_cpu, cls_cpu, facing_cpu, half_cpu, horiz_cpu)
+
+    # ── 7. Serialize (CPU) ──
+    schem_bytes = _build_schem_bytes(coords_cpu, block_states)
 
     if output_path is not None:
         with open(output_path, "wb") as f:

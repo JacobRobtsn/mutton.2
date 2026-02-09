@@ -223,6 +223,94 @@ def _get_palette_gpu(device):
     return _palette_cache[device]
 
 
+# ──────────────────────────────────────────────
+# Material families: full block → special variant mapping
+# ──────────────────────────────────────────────
+
+def _wood_family(wood):
+    return {
+        "slab": f"minecraft:{wood}_slab",
+        "stairs": f"minecraft:{wood}_stairs",
+        "fence": f"minecraft:{wood}_fence",
+        "door": f"minecraft:{wood}_door",
+        "trapdoor": f"minecraft:{wood}_trapdoor",
+    }
+
+def _stone_family(base, has_wall=True, has_stairs=True):
+    fam = {"slab": f"minecraft:{base}_slab"}
+    if has_stairs:
+        fam["stairs"] = f"minecraft:{base}_stairs"
+    if has_wall:
+        fam["wall"] = f"minecraft:{base}_wall"
+    return fam
+
+MATERIAL_FAMILIES = {
+    # ── Wood planks ──
+    "minecraft:oak_planks":      _wood_family("oak"),
+    "minecraft:spruce_planks":   _wood_family("spruce"),
+    "minecraft:birch_planks":    _wood_family("birch"),
+    "minecraft:jungle_planks":   _wood_family("jungle"),
+    "minecraft:acacia_planks":   _wood_family("acacia"),
+    "minecraft:dark_oak_planks": _wood_family("dark_oak"),
+    "minecraft:mangrove_planks": _wood_family("mangrove"),
+    "minecraft:cherry_planks":   _wood_family("cherry"),
+    "minecraft:bamboo_planks":   _wood_family("bamboo"),
+    "minecraft:crimson_planks":  _wood_family("crimson"),
+    "minecraft:warped_planks":   _wood_family("warped"),
+    # ── Stone variants ──
+    "minecraft:stone":                _stone_family("stone", has_wall=False),
+    "minecraft:cobblestone":          _stone_family("cobblestone"),
+    "minecraft:stone_bricks":         _stone_family("stone_brick"),
+    "minecraft:mossy_stone_bricks":   _stone_family("mossy_stone_brick"),
+    "minecraft:smooth_stone":         {"slab": "minecraft:smooth_stone_slab"},
+    "minecraft:granite":              _stone_family("granite"),
+    "minecraft:polished_granite":     _stone_family("polished_granite"),
+    "minecraft:diorite":              _stone_family("diorite"),
+    "minecraft:polished_diorite":     _stone_family("polished_diorite"),
+    "minecraft:andesite":             _stone_family("andesite"),
+    "minecraft:polished_andesite":    _stone_family("polished_andesite"),
+    "minecraft:cobbled_deepslate":    _stone_family("cobbled_deepslate"),
+    "minecraft:polished_deepslate":   _stone_family("polished_deepslate"),
+    "minecraft:deepslate_bricks":     _stone_family("deepslate_brick"),
+    "minecraft:deepslate_tiles":      _stone_family("deepslate_tile"),
+    "minecraft:tuff":                 _stone_family("tuff"),
+    "minecraft:blackstone":           _stone_family("blackstone"),
+    "minecraft:polished_blackstone":  _stone_family("polished_blackstone"),
+    "minecraft:end_stone_bricks":     _stone_family("end_stone_brick"),
+    "minecraft:purpur_block":         {"slab": "minecraft:purpur_slab", "stairs": "minecraft:purpur_stairs"},
+    # ── Sandstone ──
+    "minecraft:sandstone":            _stone_family("sandstone"),
+    "minecraft:smooth_sandstone":     _stone_family("smooth_sandstone", has_wall=False),
+    "minecraft:red_sandstone":        _stone_family("red_sandstone"),
+    "minecraft:smooth_red_sandstone": _stone_family("smooth_red_sandstone", has_wall=False),
+    # ── Nether ──
+    "minecraft:nether_bricks": {
+        "slab": "minecraft:nether_brick_slab",
+        "stairs": "minecraft:nether_brick_stairs",
+        "wall": "minecraft:nether_brick_wall",
+        "fence": "minecraft:nether_brick_fence",
+    },
+    "minecraft:red_nether_bricks":    _stone_family("red_nether_brick"),
+    # ── Prismarine ──
+    "minecraft:prismarine":           _stone_family("prismarine"),
+    "minecraft:prismarine_bricks":    _stone_family("prismarine_brick", has_wall=False),
+    "minecraft:dark_prismarine":      _stone_family("dark_prismarine", has_wall=False),
+    # ── Misc ──
+    "minecraft:quartz_block":  {"slab": "minecraft:quartz_slab", "stairs": "minecraft:quartz_stairs"},
+    "minecraft:smooth_quartz": _stone_family("smooth_quartz", has_wall=False),
+    "minecraft:bricks":        _stone_family("brick"),
+    "minecraft:mud_bricks":    _stone_family("mud_brick"),
+}
+
+
+def build_block_state(block_name: str, properties: dict) -> str:
+    """Build 'minecraft:oak_stairs[facing=north,half=bottom,shape=straight]' style string."""
+    if not properties:
+        return block_name
+    props = ",".join(f"{k}={v}" for k, v in sorted(properties.items()))
+    return f"{block_name}[{props}]"
+
+
 @torch.no_grad()
 def match_colors_gpu(colors: torch.Tensor) -> torch.Tensor:
     """
