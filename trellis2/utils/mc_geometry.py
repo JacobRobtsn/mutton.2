@@ -127,7 +127,7 @@ def classify_voxels(neighbors: torch.Tensor, detect_doors: bool = False):
     # ── Stair: air above, solid below, exactly 1 open horizontal (overrides slab) ──
     stair = is_surface & (~has_up) & has_down & (n_horiz_air == 1)
     open_horiz = ~horiz                 # True where air
-    horiz_dirs = torch.tensor([_EAST, _WEST, _SOUTH, _NORTH], device=device)
+    horiz_dirs = torch.tensor([_EAST, _WEST, _SOUTH, _NORTH], dtype=torch.int32, device=device)
     open_dir_idx   = open_horiz.float().argmax(dim=1)   # index of the open side
     stair_facing   = horiz_dirs[open_dir_idx]
     cls[stair]     = STAIR
