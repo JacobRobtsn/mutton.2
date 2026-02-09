@@ -311,23 +311,40 @@ def build_block_state(block_name: str, properties: dict) -> str:
     return f"{block_name}[{props}]"
 
 
+def get_allowed_indices(block_names_list: list) -> list:
+    """Return indices into BLOCK_NAMES for the given allowlist names."""
+    name_to_idx = {name: i for i, name in enumerate(BLOCK_NAMES)}
+    return [name_to_idx[n] for n in block_names_list if n in name_to_idx]
+
+
 @torch.no_grad()
-def match_colors_gpu(colors: torch.Tensor) -> torch.Tensor:
+def match_colors_gpu(colors: torch.Tensor,
+                     allowed_indices: torch.Tensor = None) -> torch.Tensor:
     """
     GPU brute-force nearest-neighbor: for each input color find the closest
     palette entry by squared L2 distance.
     
     Args:
         colors: (N, 3) float tensor on CUDA, values 0-255
+        allowed_indices: optional (K',) int64 tensor — restrict matching to
+                         these BLOCK_NAMES indices. If None, use full palette.
     
     Returns:
-        (N,) int64 tensor of palette indices on same device
+        (N,) int64 tensor of palette indices (into full BLOCK_NAMES) on same device
     """
-    palette = _get_palette_gpu(colors.device)  # (K, 3)
-    # Squared L2 via expansion: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a·b
-    # This avoids materializing the full (N, K, 3) difference tensor
-    a_sq = (colors * colors).sum(dim=1, keepdim=True)      # (N, 1)
-    b_sq = (palette * palette).sum(dim=1, keepdim=True).T   # (1, K)
-    dots = colors @ palette.T                                # (N, K)
-    dists = a_sq + b_sq - 2.0 * dots                        # (N, K)
-    return dists.argmin(dim=1)                               # (N,)
+    full_palette = _get_palette_gpu(colors.device)  # (K, 3)
+
+    if allowed_indices is not None and len(allowed_indices) > 0:
+        sub_palette = full_palette[allowed_indices]          # (K', 3)
+        a_sq = (colors * colors).sum(dim=1, keepdim=True)   # (N, 1)
+        b_sq = (sub_palette * sub_palette).sum(dim=1, keepdim=True).T  # (1, K')
+        dots = colors @ sub_palette.T                        # (N, K')
+        dists = a_sq + b_sq - 2.0 * dots                    # (N, K')
+        sub_idxs = dists.argmin(dim=1)                       # (N,)
+        return allowed_indices[sub_idxs]                     # remap to full indices
+    else:
+        a_sq = (colors * colors).sum(dim=1, keepdim=True)    # (N, 1)
+        b_sq = (full_palette * full_palette).sum(dim=1, keepdim=True).T  # (1, K)
+        dots = colors @ full_palette.T                        # (N, K)
+        dists = a_sq + b_sq - 2.0 * dots                     # (N, K)
+        return dists.argmin(dim=1)                            # (N,)

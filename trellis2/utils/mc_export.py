@@ -17,6 +17,7 @@ import torch
 
 from .mc_palette import (
     match_colors_gpu, BLOCK_NAMES, MATERIAL_FAMILIES, build_block_state,
+    get_allowed_indices,
 )
 from .mc_geometry import (
     classify_and_resolve,
@@ -343,6 +344,7 @@ def to_schem(
     target_resolution: Optional[int] = 128,
     output_path: Optional[str] = None,
     detect_doors: bool = False,
+    allowed_blocks: Optional[list] = None,
 ) -> bytes:
     """
     Convert a TRELLIS.2 MeshWithVoxel to a Minecraft .schem file.
@@ -355,6 +357,10 @@ def to_schem(
         target_resolution: downsample to this block count per axis (default 128).
         output_path: if set, write .schem to this path
         detect_doors: enable door/trapdoor detection (prone to false positives)
+        allowed_blocks: optional list of block names (e.g. ["minecraft:oak_planks",
+                        "minecraft:stone"]). Only these blocks will be used for
+                        color matching; their special variants (slabs, stairs, etc.)
+                        are included automatically. If None/empty, full palette.
     
     Returns:
         gzipped .schem bytes
@@ -375,9 +381,15 @@ def to_schem(
     elif native_res > 256:
         coords, colors = _downsample_gpu(coords, colors, native_res, 256)
 
-    # ── 3. GPU color matching ──
+    # ── 3. GPU color matching (optionally filtered) ──
+    allowed_idx = None
+    if allowed_blocks:
+        idx_list = get_allowed_indices(allowed_blocks)
+        if idx_list:
+            allowed_idx = torch.tensor(idx_list, dtype=torch.int64, device=device)
+
     colors_255 = (colors * 255.0).clamp(0, 255)
-    palette_idxs = match_colors_gpu(colors_255)               # (M,) int64 on GPU
+    palette_idxs = match_colors_gpu(colors_255, allowed_indices=allowed_idx)  # (M,)
 
     # ── 4. GPU geometry analysis ──
     grid_size = int(coords.max().item()) + 1
