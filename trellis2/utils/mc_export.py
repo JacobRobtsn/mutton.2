@@ -169,9 +169,10 @@ def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> 
     coords_cpu = coords_cpu - min_c
     max_c = coords_cpu.max(axis=0)
 
-    width  = int(max_c[0]) + 1
-    height = int(max_c[1]) + 1
-    length = int(max_c[2]) + 1
+    # TRELLIS coords are (X, Z, Y) — swap col 1↔2 for Minecraft Y-up
+    width  = int(max_c[0]) + 1   # X
+    height = int(max_c[2]) + 1   # TRELLIS Z → MC Y (up)
+    length = int(max_c[1]) + 1   # TRELLIS Y → MC Z (depth)
 
     # Collect unique palette entries actually used
     used_palette = np.unique(palette_idxs_cpu)
@@ -187,9 +188,10 @@ def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> 
     flat = np.zeros(total, dtype=np.int32)
 
     # Vectorized scatter: compute linear indices then assign
+    # Swap TRELLIS col1↔col2 so MC Y (up) = TRELLIS col2
     x = coords_cpu[:, 0].astype(np.int64)
-    y = coords_cpu[:, 1].astype(np.int64)
-    z = coords_cpu[:, 2].astype(np.int64)
+    y = coords_cpu[:, 2].astype(np.int64)   # TRELLIS Z → MC Y
+    z = coords_cpu[:, 1].astype(np.int64)   # TRELLIS Y → MC Z
     lin = y * length * width + z * width + x
     # Remap palette indices
     remap_arr = np.zeros(len(BLOCK_NAMES), dtype=np.int32)
