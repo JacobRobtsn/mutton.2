@@ -26,6 +26,7 @@ _TAG_SHORT = 2
 _TAG_INT = 3
 _TAG_BYTE_ARRAY = 7
 _TAG_STRING = 8
+_TAG_LIST = 9
 _TAG_COMPOUND = 10
 _TAG_INT_ARRAY = 11
 
@@ -43,6 +44,11 @@ def _wbarr(buf, n, d):   _whdr(buf, _TAG_BYTE_ARRAY, n); buf.write(struct.pack("
 def _wiarr(buf, n, vs):  _whdr(buf, _TAG_INT_ARRAY, n); buf.write(struct.pack(">i", len(vs))); buf.write(struct.pack(f">{len(vs)}i", *vs))
 def _wcstart(buf, n):    _whdr(buf, _TAG_COMPOUND, n)
 def _wcend(buf):          buf.write(b'\x00')
+def _wlist_empty(buf, n, elem_type):
+    """Write an empty TAG_List."""
+    _whdr(buf, _TAG_LIST, n)
+    buf.write(struct.pack(">b", elem_type))   # element tag type
+    buf.write(struct.pack(">i", 0))            # length = 0
 
 
 # ──────────────────────────────────────────────
@@ -197,7 +203,8 @@ def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> 
     # Build palette map for NBT
     palette_map = {name: i for i, name in enumerate(block_names)}
 
-    # Write NBT
+    # Write NBT — Sponge Schematic v2
+    # Root is an unnamed compound wrapping "Schematic" compound for max compat
     buf = io.BytesIO()
     _wcstart(buf, "Schematic")
     _wint(buf, "Version", 2)
@@ -213,6 +220,9 @@ def _build_schem_bytes(coords_cpu: np.ndarray, palette_idxs_cpu: np.ndarray) -> 
 
     _wint(buf, "PaletteMax", len(palette_map))
     _wbarr(buf, "BlockData", block_data)
+
+    # BlockEntities — required by WorldEdit/FAWE even if empty
+    _wlist_empty(buf, "BlockEntities", _TAG_COMPOUND)
 
     _wcstart(buf, "Metadata")
     _wstr(buf, "Generator", "TRELLIS2-Minecraft")
