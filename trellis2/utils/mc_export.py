@@ -165,6 +165,62 @@ def _downsample_gpu(coords: torch.Tensor, colors: torch.Tensor,
 
 
 # ──────────────────────────────────────────────
+# GPU spatial denoising (3D mode filter)
+# ──────────────────────────────────────────────
+
+@torch.no_grad()
+def _denoise_palette_gpu(coords: torch.Tensor, palette_idxs: torch.Tensor,
+                         grid_size: int, iterations: int = 3) -> torch.Tensor:
+    """
+    GPU 3D mode filter on block palette indices.
+    Each voxel adopts the most common block in its 3×3×3 neighborhood.
+    Eliminates per-voxel color noise while preserving region boundaries.
+
+    Args:
+        coords:       (N, 3) int tensor on CUDA
+        palette_idxs: (N,) int64 tensor of palette indices
+        grid_size:    dense grid dimension
+        iterations:   number of filter passes (more = smoother)
+
+    Returns:
+        (N,) int64 tensor of denoised palette indices
+    """
+    device = coords.device
+    N = coords.shape[0]
+    num_palette = int(palette_idxs.max().item()) + 1
+
+    # 3×3×3 neighbor offsets (27 including self)
+    offsets = torch.tensor(
+        [[dx, dy, dz] for dx in (-1, 0, 1)
+                       for dy in (-1, 0, 1)
+                       for dz in (-1, 0, 1)],
+        device=device,
+    )  # (27, 3)
+
+    current = palette_idxs.clone()
+
+    for _ in range(iterations):
+        # Dense grid: coord → palette index (−1 = empty)
+        grid = torch.full((grid_size, grid_size, grid_size), -1,
+                          dtype=torch.int64, device=device)
+        grid[coords[:, 0], coords[:, 1], coords[:, 2]] = current
+
+        # Vote-count matrix: (N, num_palette)
+        counts = torch.zeros(N, num_palette, device=device, dtype=torch.float32)
+
+        for off in offsets:
+            nc = (coords + off.unsqueeze(0)).clamp(0, grid_size - 1)
+            nidx = grid[nc[:, 0], nc[:, 1], nc[:, 2]]          # (N,)
+            valid = (nidx >= 0).float().unsqueeze(1)            # (N, 1)
+            nidx_safe = nidx.clamp(min=0).unsqueeze(1)          # (N, 1)
+            counts.scatter_add_(1, nidx_safe, valid)
+
+        current = counts.argmax(dim=1).to(palette_idxs.dtype)
+
+    return current
+
+
+# ──────────────────────────────────────────────
 # Block state resolution (CPU)
 # ──────────────────────────────────────────────
 
@@ -345,6 +401,7 @@ def to_schem(
     output_path: Optional[str] = None,
     detect_doors: bool = False,
     allowed_blocks: Optional[list] = None,
+    denoise_iterations: int = 0,
 ) -> bytes:
     """
     Convert a TRELLIS.2 MeshWithVoxel to a Minecraft .schem file.
@@ -361,6 +418,10 @@ def to_schem(
                         "minecraft:stone"]). Only these blocks will be used for
                         color matching; their special variants (slabs, stairs, etc.)
                         are included automatically. If None/empty, full palette.
+        denoise_iterations: number of 3×3×3 mode-filter passes on block palette
+                            indices after color matching. Higher = less color noise,
+                            each region converges to a single block type.
+                            Recommended: 3–5 for clean builds. 0 = off.
     
     Returns:
         gzipped .schem bytes
@@ -390,6 +451,12 @@ def to_schem(
 
     colors_255 = (colors * 255.0).clamp(0, 255)
     palette_idxs = match_colors_gpu(colors_255, allowed_indices=allowed_idx)  # (M,)
+
+    # ── 3b. GPU spatial denoising ──
+    if denoise_iterations > 0:
+        grid_size_dn = int(coords.max().item()) + 1
+        palette_idxs = _denoise_palette_gpu(
+            coords, palette_idxs, grid_size_dn, iterations=denoise_iterations)
 
     # ── 4. GPU geometry analysis ──
     grid_size = int(coords.max().item()) + 1

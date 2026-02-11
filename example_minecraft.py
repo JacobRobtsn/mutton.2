@@ -28,6 +28,7 @@ schem_bytes = to_schem(
     mesh,
     target_resolution=TARGET_RESOLUTION,
     output_path=OUTPUT_PATH,
+    denoise_iterations=5,       # 3-5 eliminates color noise; 0 = off
 )
 
 print(f"Saved {OUTPUT_PATH} ({len(schem_bytes)} bytes)")
